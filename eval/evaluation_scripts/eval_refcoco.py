@@ -58,7 +58,7 @@ if __name__ == "__main__":
         split = 'refcoco_val'
 
     output_dir = '../outputs/refcoco'  # Add the output directory, default is logs
-
+    
     log_result_paths = [os.path.join(output_dir, f'{split}_{i}_pred_results_{suffix}.json') for i in range(8)]
 
     preds = []

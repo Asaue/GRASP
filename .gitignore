@@ -4,3 +4,4 @@ dataset
 *.egg-info
 __pycache__
 wandb
+envs/
