@@ -13,7 +13,7 @@ model_path="/Data/Docker_liuwu/models/PaDT_REC_3B"
 echo "data_paths: $data_paths"
 echo "image_folders: $image_folders"
 
-export EXP_NAME="PaDT-REC-3B_crack" # TODO: change this to your own experiment name
+export EXP_NAME="PaDT-REC-3B_RL_crack" # TODO: change this to your own experiment name
 cd ${REPO_HOME}/src/PaDT
 
 # create the run directory and log file

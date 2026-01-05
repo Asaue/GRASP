@@ -439,49 +439,89 @@ class PaDTSFTTrainer(Trainer):
         completion_inputs = super()._prepare_inputs(completion_inputs)
         completion_ids, completion_mask = completion_inputs["input_ids"], completion_inputs["attention_mask"]
 
-        # prepare for Robust Per-token Cross-Entropy Loss.
+        # ------------------------------------------------------------------
+        # [修改点] 准备数据结构
+        # ------------------------------------------------------------------
         loss_masks = []
+        valid_masks = []         # [新增] 用于RL: 标记所有裂缝Patch
+        gt_points_list = []      # [新增] 用于Point Loss: 存放GT点
+        gt_points_indices = []   # [新增] 用于Point Loss: 存放GT点对应的全局Token Index
+        
         gt_bboxes = []
         vision_patch_nums = torch.nn.functional.pad((multimodal_inputs['image_grid_thw'].cumprod(-1)[:, -1] // (self.model.config.vision_config.spatial_merge_size ** 2)).cumsum(-1), (1, 0), 'constant', 0)
         all_vision_patch_nums = vision_patch_nums[-1]
+        
         for sol, vpn in zip(solutions, vision_patch_nums[:-1]):
             for obj in sol['objects']:
+                # 1. SFT Mask (原逻辑): Mask掉valid但未被pick的patch
                 this_object_loss_mask = torch.zeros((obj['picked'].shape[0], all_vision_patch_nums), device=self.accelerator.device, dtype=torch.bool)
                 this_object_loss_mask[:, vpn.item() + np.array(obj['patches'])] = True
                 this_object_loss_mask[np.arange(obj['picked'].shape[0]), vpn.item() + obj['picked']] = False
                 loss_masks.append(this_object_loss_mask)
-                # obj['bbox']: x1, y1, x2, y2. Value in [0, 1].
+
+                # 2. [新增] RL Valid Mask: 标记所有属于裂缝的Patch
+                this_object_valid_mask = torch.zeros((obj['picked'].shape[0], all_vision_patch_nums), device=self.accelerator.device, dtype=torch.bool)
+                global_patch_indices = vpn.item() + np.array(obj['patches'])
+                this_object_valid_mask[:, global_patch_indices] = True
+                valid_masks.append(this_object_valid_mask)
+                
+                # 3. [新增] 收集 GT Points
+                if 'patch_points' in obj:
+                    pts = torch.tensor(obj['patch_points'], device=self.accelerator.device, dtype=torch.bfloat16) 
+                    gt_points_list.append(pts)
+                    gt_points_indices.append(torch.tensor(global_patch_indices, device=self.accelerator.device))
+
                 gt_bboxes.append(obj['bbox'])
 
         loss_masks = torch.cat(loss_masks, dim=0)
         loss_masks = torch.nn.functional.pad(loss_masks, (self.model_embed_token_size, 0), 'constant', False)
+        
+        valid_masks = torch.cat(valid_masks, dim=0)
+        valid_masks = torch.nn.functional.pad(valid_masks, (self.model_embed_token_size, 0), 'constant', False)
+
         gt_bboxes = torch.Tensor(gt_bboxes).to(self.accelerator.device).to(torch.bfloat16)
         if len(gt_bboxes.shape) == 1:
             gt_bboxes = gt_bboxes.unsqueeze(dim=-1).repeat_interleave(4, dim=-1)
 
-        # Concatenate for full sequence
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
         input_ids = self.processing_class.assign_to_global_vrt_id(input_ids, multimodal_inputs['image_grid_thw'])
 
-        # Get the current policy's log probabilities
         model_output = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **multimodal_inputs)
 
         logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
-        input_ids = input_ids[:, prompt_length:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        input_ids = input_ids[:, prompt_length:]  # (B, L-1)
+        
+        # ------------------------------------------------------------------
+        # [修改点] 计算 RL Loss (Intersection Reward)
+        # ------------------------------------------------------------------
+        rl_loss = 0.0
         if self.args.use_sft_vp_mask:
             visual_patch_mask = input_ids >= self.model_embed_token_size
+            
+            # Masking前先算 Reward
+            vrt_logits = logits[visual_patch_mask]
+            vrt_probs = torch.nn.functional.softmax(vrt_logits, dim=-1)
+            
+            # P(Hit): 预测分布落在 Mask 区域的概率和
+            prob_hit = (vrt_probs * valid_masks).sum(dim=-1)
+            
+            # Reward: 命中+1，未命中-1 (2p - 1)
+            expected_reward = 2 * prob_hit - 1
+            
+            rl_loss = -expected_reward.mean()
+            self._metrics['rl_loss'].append(self.accelerator.gather_for_metrics(rl_loss).mean().item())
+
+            # 原有 SFT masking
             logits[visual_patch_mask] = logits[visual_patch_mask].masked_fill(loss_masks, float('-inf'))
         
-        # decode to bbox
-        hidden_states = torch.stack(model_output.hidden_states, dim=1)[:, -1:, prompt_length-1:-1].permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() # [BS, Layers, N, Dim] -> [N, Layers, BS, 1, D]
-        completions, feats, labels, vps, vps_feats = parseVRTintoCompletion(self.processing_class, completion_ids, hidden_states, torch.tensor([False] * batch_size), model_output.past_image_embeds, multimodal_inputs['image_grid_thw']) # hidden_states: [N, Layers, BS, D]
+        hidden_states = torch.stack(model_output.hidden_states, dim=1)[:, -1:, prompt_length-1:-1].permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() 
+        completions, feats, labels, vps, vps_feats = parseVRTintoCompletion(self.processing_class, completion_ids, hidden_states, torch.tensor([False] * batch_size), model_output.past_image_embeds, multimodal_inputs['image_grid_thw']) 
         low_res_image_embeds = model_output.past_image_embeds
         high_res_image_embeds = model_output.past_high_res_image_embeds
         visual_pe = model_output.past_visual_pe
         
-        # warm up stage: using visual prototype rather than hidden features to feed into decoder.
         if self.state.epoch < (self.state.num_train_epochs / 4) and self.state.global_step < 300 and self.args.use_warm_up:
             feats = vps_feats
         decoded_list = model(feats, low_res_image_embeds, high_res_image_embeds, multimodal_inputs['image_grid_thw'], visual_pe, is_main=False)
@@ -506,7 +546,6 @@ class PaDTSFTTrainer(Trainer):
         else:
             mask_loss = 0.
 
-        # token loss
         logit_log_probs = logits.log_softmax(dim=-1)
         token_log_prob = torch.gather(logit_log_probs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
         per_token_loss = -token_log_prob
@@ -514,9 +553,7 @@ class PaDTSFTTrainer(Trainer):
         self._metrics['sft_loss'].append(self.accelerator.gather_for_metrics(sft_loss).mean().item())
         
         if self.args.use_bbox_loss:
-            # bbox loss
-            pred_bboxes = decoded_list['pred_boxes']  # num_bbox, 4 [cx, cy, w, h]
-            # gt_bboxes # num_bbox, 4 [x1, y1, x2, y2]
+            pred_bboxes = decoded_list['pred_boxes'] 
             num_bboxes = gt_bboxes.shape[0]
             giou, iou = self.generalized_box_iou(self.box_cxcywh_to_xyxy(pred_bboxes), gt_bboxes)
             giou = torch.diag(giou).to(pred_bboxes.dtype)
@@ -529,15 +566,241 @@ class PaDTSFTTrainer(Trainer):
             bbox_loss = 0.
 
         if self.args.use_bbox_loss and self.args.use_score_loss:
-            # score loss
-            pred_score = decoded_list['pred_score'].sigmoid() * 2. - 1.  # [-1, 1]
+            pred_score = decoded_list['pred_score'].sigmoid() * 2. - 1. 
             score_loss = torch.nn.functional.mse_loss(pred_score, giou.unsqueeze(1).detach(), reduction='sum') / (num_bboxes + 1e-4)
             self._metrics['score_loss'].append(self.accelerator.gather_for_metrics(score_loss).mean().item())
         else:
             score_loss = 0.
 
-        loss = sft_loss.mean() + bbox_loss + score_loss + mask_loss
+        # ------------------------------------------------------------------
+        # [修改点] 计算 Point Loss (MSE)
+        # ------------------------------------------------------------------
+        point_loss = 0.0
+        if len(gt_points_list) > 0:
+            all_gt_points = torch.cat(gt_points_list, dim=0)
+            all_gt_indices = torch.cat(gt_points_indices, dim=0)
+            
+            # 利用 Index 提取对应的预测点
+            all_pred_points = decoded_list['pred_points_local'][all_gt_indices]
+            
+            point_loss = torch.nn.functional.mse_loss(all_pred_points, all_gt_points)
+            self._metrics['point_loss'].append(self.accelerator.gather_for_metrics(point_loss).mean().item())
+
+        # 总 Loss
+        loss = sft_loss.mean() + bbox_loss + score_loss + mask_loss + rl_loss + point_loss
         return loss
+
+    # def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    #     if return_outputs:
+    #         raise ValueError("The PaDTTrainer does not support returning outputs")
+
+    #     prompt_text = [self.processing_class.apply_chat_template(i['prompt'], tokenize=False, add_generation_prompt=True) for i in inputs]
+        
+    #     images = []
+    #     completions = []
+    #     solutions = []
+    #     for idx, x in enumerate(inputs):
+    #         # input_images
+    #         assert len(x['image_path']) == 1, "current support only an image per sample"
+
+    #         for img in x['image_path']:
+    #             image = PIL.Image.open(img)
+    #             try:
+    #                 w, h = image.size
+    #                 if w < 28 or h < 28:
+    #                     if w < h:
+    #                         new_w = 28
+    #                         new_h = int(h * (28 / w))
+    #                     else:
+    #                         new_h = 28
+    #                         new_w = int(w * (28 / h))
+    #                 image = image.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
+    #             except:
+    #                 pass
+    #             images.append(image)
+            
+    #         # completion
+    #         im_w, im_h = image.size
+    #         patch_w, patch_h = round(im_w / 28), round(im_h / 28)
+
+    #         solution = x['solution']
+    #         completion = solution['text']
+    #         pattern = r'(<\|Obj_(\d+)\|>)'
+    #         obj_in_completion = re.findall(pattern, completion)
+    #         obj_strs = [i[0] for i in obj_in_completion]
+    #         objs = [solution['objects'][int(i[1])] for i in obj_in_completion]
+    #         pattern_without_matching = r'<\|Obj_\d+\|>'
+    #         completion_parts = re.split(pattern_without_matching, completion)
+            
+    #         completion_with_vrt = completion_parts[0]
+    #         new_objs = []
+    #         for obj_str, completion_part, obj in zip(obj_strs, completion_parts[1:], objs):
+    #             obj_ = obj.copy()
+    #             selected_patches = np.array(obj_['patches'])
+    #             if self.args.random_select_patch_num < 0:
+    #                 pick_patch = selected_patches.copy()
+    #             elif self.args.random_select_patch is False:
+    #                 selected_patches_x, selected_patches_y = selected_patches % patch_w, selected_patches // patch_w
+                    
+    #                 left_patches_m = selected_patches_x == selected_patches_x.min()
+    #                 right_patches_m = selected_patches_x == selected_patches_x.max()
+    #                 top_patches_m = selected_patches_y == selected_patches_y.min()
+    #                 bottom_patches_m = selected_patches_y == selected_patches_y.max()
+    #                 centre_patches_m = (left_patches_m + right_patches_m + top_patches_m + bottom_patches_m) == 0                        
+                    
+    #                 left_patches, right_patches, top_patches, bottom_patches, centre_patches = \
+    #                     selected_patches[left_patches_m], \
+    #                     selected_patches[right_patches_m], \
+    #                     selected_patches[top_patches_m], \
+    #                     selected_patches[bottom_patches_m], \
+    #                     selected_patches[centre_patches_m]
+    #                 if centre_patches_m.sum() == 0:
+    #                     centre_patches = selected_patches
+                        
+    #                 pick_patch = np.array([np.random.choice(centre_patches), np.random.choice(left_patches), np.random.choice(top_patches), np.random.choice(right_patches), np.random.choice(bottom_patches)])
+    #             else:
+    #                 if selected_patches.shape[0] < self.args.random_select_patch_num:
+    #                     pick_patch = np.random.choice(selected_patches, self.args.random_select_patch_num, replace=True)
+    #                 else:
+    #                     pick_patch = np.random.choice(selected_patches, self.args.random_select_patch_num, replace=False)
+            
+    #             obj_['picked'] = pick_patch
+    #             new_objs.append(obj_)
+    #             completion_with_vrt += self.processing_class.pid2vrt(pick_patch) + completion_part
+
+    #         solutions.append({
+    #             'text': solution['text'],
+    #             'objects': new_objs
+    #         })
+    #         completions.append(completion_with_vrt + self.processing_class.tokenizer.eos_token)
+
+    #     # tokenizing
+    #     prompt_inputs = self.processing_class(
+    #         text=prompt_text,
+    #         images=images,
+    #         return_tensors='pt',
+    #         padding=True,
+    #         padding_side='left',
+    #         add_special_tokens=False
+    #     )
+    #     prompt_inputs = super()._prepare_inputs(prompt_inputs)
+    #     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+    #     batch_size = prompt_ids.size(0)
+    #     prompt_length = prompt_ids.size(1)
+    #     multimodal_inputs = {
+    #         'image_grid_thw': prompt_inputs['image_grid_thw'],
+    #         'pixel_values': prompt_inputs['pixel_values']
+    #     }
+        
+    #     completion_inputs = self.processing_class(
+    #         text=completions,
+    #         return_tensors='pt',
+    #         padding=True,
+    #         padding_side='right',
+    #         add_special_tokens=False
+    #     )
+    #     completion_inputs = super()._prepare_inputs(completion_inputs)
+    #     completion_ids, completion_mask = completion_inputs["input_ids"], completion_inputs["attention_mask"]
+
+    #     # prepare for Robust Per-token Cross-Entropy Loss.
+    #     loss_masks = []
+    #     gt_bboxes = []
+    #     vision_patch_nums = torch.nn.functional.pad((multimodal_inputs['image_grid_thw'].cumprod(-1)[:, -1] // (self.model.config.vision_config.spatial_merge_size ** 2)).cumsum(-1), (1, 0), 'constant', 0)
+    #     all_vision_patch_nums = vision_patch_nums[-1]
+    #     for sol, vpn in zip(solutions, vision_patch_nums[:-1]):
+    #         for obj in sol['objects']:
+    #             this_object_loss_mask = torch.zeros((obj['picked'].shape[0], all_vision_patch_nums), device=self.accelerator.device, dtype=torch.bool)
+    #             this_object_loss_mask[:, vpn.item() + np.array(obj['patches'])] = True
+    #             this_object_loss_mask[np.arange(obj['picked'].shape[0]), vpn.item() + obj['picked']] = False
+    #             loss_masks.append(this_object_loss_mask)
+    #             # obj['bbox']: x1, y1, x2, y2. Value in [0, 1].
+    #             gt_bboxes.append(obj['bbox'])
+
+    #     loss_masks = torch.cat(loss_masks, dim=0)
+    #     loss_masks = torch.nn.functional.pad(loss_masks, (self.model_embed_token_size, 0), 'constant', False)
+    #     gt_bboxes = torch.Tensor(gt_bboxes).to(self.accelerator.device).to(torch.bfloat16)
+    #     if len(gt_bboxes.shape) == 1:
+    #         gt_bboxes = gt_bboxes.unsqueeze(dim=-1).repeat_interleave(4, dim=-1)
+
+    #     # Concatenate for full sequence
+    #     input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+    #     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+
+    #     input_ids = self.processing_class.assign_to_global_vrt_id(input_ids, multimodal_inputs['image_grid_thw'])
+
+    #     # Get the current policy's log probabilities
+    #     model_output = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **multimodal_inputs)
+
+    #     logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
+    #     input_ids = input_ids[:, prompt_length:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+    #     if self.args.use_sft_vp_mask:
+    #         visual_patch_mask = input_ids >= self.model_embed_token_size
+    #         logits[visual_patch_mask] = logits[visual_patch_mask].masked_fill(loss_masks, float('-inf'))
+        
+    #     # decode to bbox
+    #     hidden_states = torch.stack(model_output.hidden_states, dim=1)[:, -1:, prompt_length-1:-1].permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() # [BS, Layers, N, Dim] -> [N, Layers, BS, 1, D]
+    #     completions, feats, labels, vps, vps_feats = parseVRTintoCompletion(self.processing_class, completion_ids, hidden_states, torch.tensor([False] * batch_size), model_output.past_image_embeds, multimodal_inputs['image_grid_thw']) # hidden_states: [N, Layers, BS, D]
+    #     low_res_image_embeds = model_output.past_image_embeds
+    #     high_res_image_embeds = model_output.past_high_res_image_embeds
+    #     visual_pe = model_output.past_visual_pe
+        
+    #     # warm up stage: using visual prototype rather than hidden features to feed into decoder.
+    #     if self.state.epoch < (self.state.num_train_epochs / 4) and self.state.global_step < 300 and self.args.use_warm_up:
+    #         feats = vps_feats
+    #     decoded_list = model(feats, low_res_image_embeds, high_res_image_embeds, multimodal_inputs['image_grid_thw'], visual_pe, is_main=False)
+    #     del model_output
+
+    #     if self.args.use_mask_loss:
+    #         gt_mask = torch.zeros_like(decoded_list['pred_mask'])
+    #         loss_mask = torch.zeros_like(decoded_list['pred_mask'])
+
+    #         obj_idx = 0
+    #         for sol in solutions:
+    #             for obj in sol['objects']:
+    #                 if 'rle' in obj:
+    #                     gt_m = mask.decode(obj['rle'])
+    #                     mask_h, mask_w = decoded_list['pred_mask_valid_hw'][0][obj_idx].item(), decoded_list['pred_mask_valid_hw'][1][obj_idx].item()
+    #                     resized_gt_m = torch.from_numpy(cv2.resize(gt_m.astype(np.float32()), (mask_w * 4, mask_h * 4)) > 0.5).to(gt_mask.dtype).to(gt_mask.device)
+    #                     gt_mask[obj_idx, :mask_h * 4, :mask_w * 4] = resized_gt_m
+    #                     loss_mask[obj_idx, :mask_h * 4, :mask_w * 4] = 1.0
+    #                 obj_idx += 1
+    #         mask_loss = self.dice_loss(decoded_list['pred_mask'], gt_mask, loss_mask) + self.sigmoid_focal_loss(decoded_list['pred_mask'], gt_mask, loss_mask)
+    #         self._metrics['mask_loss'].append(self.accelerator.gather_for_metrics(mask_loss).mean().item())
+    #     else:
+    #         mask_loss = 0.
+
+    #     # token loss
+    #     logit_log_probs = logits.log_softmax(dim=-1)
+    #     token_log_prob = torch.gather(logit_log_probs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    #     per_token_loss = -token_log_prob
+    #     sft_loss = ((per_token_loss * completion_mask).sum(dim=-1) / (completion_mask.sum(dim=-1) + 1e-4)).to(logits.dtype)
+    #     self._metrics['sft_loss'].append(self.accelerator.gather_for_metrics(sft_loss).mean().item())
+        
+    #     if self.args.use_bbox_loss:
+    #         # bbox loss
+    #         pred_bboxes = decoded_list['pred_boxes']  # num_bbox, 4 [cx, cy, w, h]
+    #         # gt_bboxes # num_bbox, 4 [x1, y1, x2, y2]
+    #         num_bboxes = gt_bboxes.shape[0]
+    #         giou, iou = self.generalized_box_iou(self.box_cxcywh_to_xyxy(pred_bboxes), gt_bboxes)
+    #         giou = torch.diag(giou).to(pred_bboxes.dtype)
+    #         bbox_loss = 1. - giou.sum() / (num_bboxes + 1e-4)
+    #         bbox_loss += torch.nn.functional.l1_loss(pred_bboxes, self.box_xyxy_to_cxcywh(gt_bboxes), reduction='none').sum() / (num_bboxes + 1e-4)
+    #         self._metrics['bbox_loss'].append(self.accelerator.gather_for_metrics(bbox_loss).mean().item())
+    #         self._metrics['iou'].append(self.accelerator.gather_for_metrics(torch.diag(iou).sum() / (num_bboxes + 1e-4)).mean().item())
+    #         self._metrics['giou'].append(self.accelerator.gather_for_metrics(giou.sum() / (num_bboxes + 1e-4)).mean().item())
+    #     else:
+    #         bbox_loss = 0.
+
+    #     if self.args.use_bbox_loss and self.args.use_score_loss:
+    #         # score loss
+    #         pred_score = decoded_list['pred_score'].sigmoid() * 2. - 1.  # [-1, 1]
+    #         score_loss = torch.nn.functional.mse_loss(pred_score, giou.unsqueeze(1).detach(), reduction='sum') / (num_bboxes + 1e-4)
+    #         self._metrics['score_loss'].append(self.accelerator.gather_for_metrics(score_loss).mean().item())
+    #     else:
+    #         score_loss = 0.
+
+    #     loss = sft_loss.mean() + bbox_loss + score_loss + mask_loss
+    #     return loss
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics

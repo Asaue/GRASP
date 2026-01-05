@@ -392,7 +392,8 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             cu_patch = torch.Tensor([0, self.config.vision_config.spatial_merge_size ** 2]).to(self.device).to(torch.int32)
             obj_image_grid_thws = torch.Tensor([[1, 2, 2]]).to(self.device).to(torch.int64)
 
-        bbox_output, score_output, mask_logits, mask_HWs = self.vl_decoder(cu_object_vp_feat, cu_low_res_feats, cu_high_res_feats, cu_visual_pe, cu_patch, obj_image_grid_thws, self.device)
+        # [修改点] 接收第 5 个返回值 pred_points_local
+        bbox_output, score_output, mask_logits, mask_HWs, pred_points_local = self.vl_decoder(cu_object_vp_feat, cu_low_res_feats, cu_high_res_feats, cu_visual_pe, cu_patch, obj_image_grid_thws, self.device)
 
         if true_value:
             return {
@@ -401,6 +402,7 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 'pred_mask': mask_logits,
                 'pred_mask_valid_hw': mask_HWs,
                 'sample_idx': cu_sample_idx,
+                'pred_points_local': pred_points_local, # [修改点] 返回预测点
             }
         else:
             return {
@@ -409,7 +411,80 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 'pred_mask': torch.zeros((0, 8, 8)).to(self.device).to(self.dtype),
                 'pred_mask_valid_hw': (),
                 'sample_idx': [],
+                'pred_points_local': torch.zeros((0, 2)).to(self.device).to(self.dtype), # [修改点] 空数据返回
             }
+        
+    # def vl_decode(
+    #     self,
+    #     object_vp_feats,
+    #     low_res_image_embeds,
+    #     high_res_image_embeds,
+    #     image_grid_thws,
+    #     visual_pes,
+    # ):
+    #     cu_object_vp_feat = sum(object_vp_feats, [])
+
+    #     true_value = True
+    #     if len(cu_object_vp_feat) > 0:
+    #         patch_offset = 0
+    #         cu_sample_idx = []
+    #         cu_low_res_feats = []
+    #         cu_high_res_feats = []
+    #         cu_visual_pe = ([], [])
+    #         cu_patch = []
+    #         obj_image_grid_thws = []
+
+    #         for sample_idx, (object_vp_feat, image_grid_thw) in enumerate(zip(object_vp_feats, image_grid_thws)):
+    #             this_sample_patch_num = image_grid_thw.cumprod(dim=-1)[-1].item()
+
+    #             low_res_image_feats = low_res_image_embeds[patch_offset // 4  : (patch_offset + this_sample_patch_num) // 4]
+    #             high_res_image_feats = high_res_image_embeds[patch_offset : patch_offset + this_sample_patch_num]
+    #             visual_pe = (visual_pes[0][patch_offset : patch_offset + this_sample_patch_num], visual_pes[1][patch_offset : patch_offset + this_sample_patch_num])
+
+    #             cu_sample_idx.extend([sample_idx] * len(object_vp_feat))
+    #             cu_low_res_feats.append(low_res_image_feats.unsqueeze(0).repeat_interleave(len(object_vp_feat), dim=0).flatten(0, 1))
+    #             cu_high_res_feats.append(high_res_image_feats.unsqueeze(0).repeat_interleave(len(object_vp_feat), dim=0).flatten(0, 1))
+    #             cu_visual_pe[0].append(visual_pe[0].unsqueeze(0).repeat_interleave(len(object_vp_feat), dim=0).flatten(0, 1))
+    #             cu_visual_pe[1].append(visual_pe[1].unsqueeze(0).repeat_interleave(len(object_vp_feat), dim=0).flatten(0, 1))
+    #             cu_patch.extend([this_sample_patch_num] * len(object_vp_feat))
+    #             patch_offset += this_sample_patch_num
+    #             obj_image_grid_thws.extend([image_grid_thw] * len(object_vp_feat))
+            
+    #         cu_patch = torch.nn.functional.pad(torch.Tensor(cu_patch).to(self.device).cumsum(dim=0), (1, 0), 'constant', 0).to(torch.int32)
+    #         cu_low_res_feats = torch.cat(cu_low_res_feats, dim=0)
+    #         cu_high_res_feats = torch.cat(cu_high_res_feats, dim=0)
+    #         cu_visual_pe = (torch.cat(cu_visual_pe[0], dim=0), torch.cat(cu_visual_pe[1], dim=0))
+    #         obj_image_grid_thws = torch.stack(obj_image_grid_thws, dim=0)
+    #     else:
+    #         true_value = False
+    #         cu_object_vp_feat = [torch.zeros((1, self.config.hidden_size)).to(self.device).to(self.dtype)]
+    #         cu_low_res_feats = torch.zeros((1, self.config.hidden_size)).to(self.device).to(self.dtype)
+    #         cu_high_res_feats = torch.zeros((1 * (self.config.vision_config.spatial_merge_size ** 2), self.config.vision_config.hidden_size)).to(self.device).to(self.dtype)
+    #         cu_visual_pe = (
+    #             torch.zeros((1 * (self.config.vision_config.spatial_merge_size ** 2), self.config.vision_config.hidden_size // self.config.vision_config.num_heads)).to(self.device).to(self.dtype), 
+    #             torch.zeros((1 * (self.config.vision_config.spatial_merge_size ** 2), self.config.vision_config.hidden_size // self.config.vision_config.num_heads)).to(self.device).to(self.dtype)
+    #         )
+    #         cu_patch = torch.Tensor([0, self.config.vision_config.spatial_merge_size ** 2]).to(self.device).to(torch.int32)
+    #         obj_image_grid_thws = torch.Tensor([[1, 2, 2]]).to(self.device).to(torch.int64)
+
+    #     bbox_output, score_output, mask_logits, mask_HWs = self.vl_decoder(cu_object_vp_feat, cu_low_res_feats, cu_high_res_feats, cu_visual_pe, cu_patch, obj_image_grid_thws, self.device)
+
+    #     if true_value:
+    #         return {
+    #             'pred_boxes': bbox_output,
+    #             'pred_score': score_output,
+    #             'pred_mask': mask_logits,
+    #             'pred_mask_valid_hw': mask_HWs,
+    #             'sample_idx': cu_sample_idx,
+    #         }
+    #     else:
+    #         return {
+    #             'pred_boxes': torch.zeros((0, 4)).to(self.device).to(self.dtype),
+    #             'pred_score': torch.zeros((0, 1)).to(self.device).to(self.dtype),
+    #             'pred_mask': torch.zeros((0, 8, 8)).to(self.device).to(self.dtype),
+    #             'pred_mask_valid_hw': (),
+    #             'sample_idx': [],
+    #         }
 
     @torch.no_grad()
     def generate(
