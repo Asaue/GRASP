@@ -392,9 +392,45 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             cu_patch = torch.Tensor([0, self.config.vision_config.spatial_merge_size ** 2]).to(self.device).to(torch.int32)
             obj_image_grid_thws = torch.Tensor([[1, 2, 2]]).to(self.device).to(torch.int64)
 
-        # [修改点] 接收第 5 个返回值 pred_points_local
+        # 1. 调用 Decoder (获取局部坐标 pred_points_local)
         bbox_output, score_output, mask_logits, mask_HWs, pred_points_local = self.vl_decoder(cu_object_vp_feat, cu_low_res_feats, cu_high_res_feats, cu_visual_pe, cu_patch, obj_image_grid_thws, self.device)
 
+        # 2. [新增核心逻辑] 将局部点转换为全局绝对坐标
+        pred_points_per_object = []
+        
+        if true_value:
+            # PaDT 默认 Patch 大小 (通常 14*2 = 28)
+            PATCH_SIZE = 14 * self.config.vision_config.spatial_merge_size
+            
+            # 重新计算 Patch 索引逻辑 (为了获取每个 Patch 的行号 row 和 列号 col)
+            obj_in_image_patch_num = cu_patch[1:] - cu_patch[:-1]
+            num_objects = obj_in_image_patch_num.shape[0]
+            sum_pn = cu_patch[-1].item()
+            
+            object_ids_per_patch = torch.repeat_interleave(torch.arange(num_objects, device=self.device), obj_in_image_patch_num)
+            offsets = cu_patch[:-1]
+            patch_indices = torch.arange(sum_pn, device=self.device, dtype=torch.int64)
+            pos_in_obj = patch_indices - offsets[object_ids_per_patch]
+            
+            # 从 Decoder 返回的 mask_HWs 中获取每一张特征图的宽 Ws
+            Hs, Ws = mask_HWs
+            Ws_per_patch = Ws[object_ids_per_patch]
+            
+            # 计算行号和列号
+            row_pos = pos_in_obj // Ws_per_patch
+            col_pos = pos_in_obj % Ws_per_patch
+
+            # 计算绝对坐标 (x, y) = (col + local_x, row + local_y) * PATCH_SIZE
+            global_y = (row_pos + pred_points_local[:, 1]) * PATCH_SIZE
+            global_x = (col_pos + pred_points_local[:, 0]) * PATCH_SIZE
+            global_points = torch.stack([global_x, global_y], dim=-1) # [Total_Patches, 2]
+
+            # 按对象分组 (inference 脚本需要 List[Tensor])
+            for i in range(num_objects):
+                mask = (object_ids_per_patch == i)
+                pred_points_per_object.append(global_points[mask])
+
+        # 3. 返回结果 (包含用于 Training 的 local 和用于 Inference 的 global points)
         if true_value:
             return {
                 'pred_boxes': bbox_output,
@@ -402,7 +438,8 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 'pred_mask': mask_logits,
                 'pred_mask_valid_hw': mask_HWs,
                 'sample_idx': cu_sample_idx,
-                'pred_points_local': pred_points_local, # [修改点] 返回预测点
+                'pred_points_local': pred_points_local, # 训练 Loss 用
+                'pred_points': pred_points_per_object,  # 推理/SAM2 用 (绝对坐标)
             }
         else:
             return {
@@ -411,7 +448,8 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 'pred_mask': torch.zeros((0, 8, 8)).to(self.device).to(self.dtype),
                 'pred_mask_valid_hw': (),
                 'sample_idx': [],
-                'pred_points_local': torch.zeros((0, 2)).to(self.device).to(self.dtype), # [修改点] 空数据返回
+                'pred_points_local': torch.zeros((0, 2)).to(self.device).to(self.dtype),
+                'pred_points': [], # 空列表
             }
         
     # def vl_decode(
