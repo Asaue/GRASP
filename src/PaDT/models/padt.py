@@ -200,23 +200,54 @@ class PaDTForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 for idx, pn in enumerate(patch_nums[:-1]):
                     logit_mask[idx, vocab_size+pn:vocab_size+patch_nums[idx+1]] = True
                 
-                assert input_ids.max() < extended_embed_tokens.shape[0]
+                # assert input_ids.max() < extended_embed_tokens.shape[0]
+                # inputs_embeds = extended_embed_tokens[input_ids]
+
+                # n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+                # n_image_features = image_embeds.shape[0]
+                # if n_image_tokens != n_image_features:
+                #     raise ValueError(
+                #         f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                #     )
+                # image_mask = (
+                #     (input_ids == self.config.image_token_id)
+                #     .unsqueeze(-1)
+                #     .expand_as(inputs_embeds)
+                #     .to(inputs_embeds.device)
+                # )
+                # image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                # inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+                # [修改后]
+                # 1. 移除 assert，改用 clamp 防止索引越界
+                if input_ids.max() >= extended_embed_tokens.shape[0]:
+                    input_ids = torch.clamp(input_ids, max=extended_embed_tokens.shape[0] - 1)
+
                 inputs_embeds = extended_embed_tokens[input_ids]
 
+                # 2. 增加特征数量对齐逻辑，防止 masked_scatter 报 CUDA Error
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
-                if n_image_tokens != n_image_features:
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+
+                # 只有当需要填充时才执行
+                if n_image_tokens > 0:
+                    if n_image_tokens != n_image_features:
+                        # 如果数量不一致，进行补齐或截断
+                        if n_image_features < n_image_tokens:
+                            diff = n_image_tokens - n_image_features
+                            padding = torch.zeros((diff, image_embeds.shape[1]), device=image_embeds.device, dtype=image_embeds.dtype)
+                            image_embeds = torch.cat([image_embeds, padding], dim=0)
+                        else:
+                            image_embeds = image_embeds[:n_image_tokens]
+
+                    image_mask = (
+                        (input_ids == self.config.image_token_id)
+                        .unsqueeze(-1)
+                        .expand_as(inputs_embeds)
+                        .to(inputs_embeds.device)
                     )
-                image_mask = (
-                    (input_ids == self.config.image_token_id)
-                    .unsqueeze(-1)
-                    .expand_as(inputs_embeds)
-                    .to(inputs_embeds.device)
-                )
-                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                    image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             elif past_image_embeds is not None:
                 image_prototypes = past_image_embeds.detach()

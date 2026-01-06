@@ -586,6 +586,60 @@ class PaDTSFTTrainer(Trainer):
             point_loss = torch.nn.functional.mse_loss(all_pred_points, all_gt_points)
             self._metrics['point_loss'].append(self.accelerator.gather_for_metrics(point_loss).mean().item())
 
+        # 改用环境变量判断，避开 parser 报错
+        if os.environ.get("PADT_INFERENCE_MODE") == "1":
+            # 提取预测结果
+            batch_results = []
+            
+            # 确保 decoded_list 存在 (前面代码应该已经生成了)
+            # 注意：decoded_list['sample_idx'] 长度就是 batch 中有效对象的数量
+            num_objects = len(decoded_list['sample_idx'])
+            
+            for i in range(num_objects):
+                # 这里的 sample_id 对应 batch 内第几张图 (batch=1时通常是0)
+                sample_id = decoded_list['sample_idx'][i]
+                
+                # 获取图像尺寸用于还原坐标
+                # 注意：image_grid_thw 是 [Batch, 3] (t, h, w)
+                img_h_grid = multimodal_inputs['image_grid_thw'][sample_id][1].item()
+                img_w_grid = multimodal_inputs['image_grid_thw'][sample_id][2].item()
+                
+                # 假设 patch size = 14
+                img_h = img_h_grid * 14
+                img_w = img_w_grid * 14
+                
+                # BBox 还原
+                cx, cy, w, h = decoded_list['pred_boxes'][i].cpu().tolist()
+                x1 = (cx - w/2) * img_w
+                y1 = (cy - h/2) * img_h
+                x2 = (cx + w/2) * img_w
+                y2 = (cy + h/2) * img_h
+                
+                # Points 获取
+                points = []
+                if 'pred_points' in decoded_list and len(decoded_list['pred_points']) > i:
+                     # pred_points 是 list of tensors
+                     points = decoded_list['pred_points'][i].cpu().tolist()
+
+                res = {
+                    "rank": self.args.local_rank,
+                    "bbox": [x1, y1, x2, y2],
+                    "score": float(decoded_list['pred_score'][i].sigmoid().item()),
+                    "points": points,
+                    # 如果能拿到原始 ID 最好，拿不到就存顺序索引
+                }
+                batch_results.append(res)
+            
+            # 写入文件
+            output_file = os.path.join(self.args.output_dir, f"inference_rank{self.args.local_rank}.jsonl")
+            with open(output_file, "a") as f:
+                for res in batch_results:
+                    f.write(json.dumps(res) + "\n")
+            
+            # 返回 0 Loss，不更新参数
+            return torch.tensor(0.0, device=model.device, requires_grad=True)
+
+
         # 总 Loss
         loss = sft_loss.mean() + bbox_loss + score_loss + mask_loss + rl_loss + point_loss
         return loss
